@@ -135,8 +135,8 @@ void MatMulCaller(float *A, float *B, float *C, int N, int K)
   auto dC = make_stride(Int<1>{}, M); // (dM, dN)
 
   // Define CTA tile sizes (static)
-  auto bM = Int<64>{};
-  auto bN = Int<64>{};
+  auto bM = Int<32>{};
+  auto bN = Int<32>{};
   auto bK = Int<64>{};
   auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M, BLK_N, BLK_K)
 
