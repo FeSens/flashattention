@@ -291,7 +291,7 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void atte
                                                                                             // Shared memory buffers
   __shared__ TA smemA[cosize_v<ASmemLayout>];
   Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout); // (BLK_Q,HS)
-  ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
+  ThrCopy thr_copy_a = copy_a.get_thread_slice(threadIdx.x);
   Tensor tAgA = thr_copy_a.partition_S(gA); // (CPY,CPY_Q,CPY_HEAD_DIM,hs_tile)
   Tensor tAsA = thr_copy_a.partition_D(sA); // (CPY,CPY_Q,CPY_HEAD_DIM)
 
@@ -327,7 +327,7 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void atte
     copy(copy_b, tBgB(_, _, _, 0), tBsB);
     cp_async_fence();
     cp_async_wait<0>();
-    ThrMMA thr_mma = mma.get_slice(threadIdx.x);
+    ThrMMA thr_mma = mma.get_thread_slice(threadIdx.x);
     Tensor tCsA = thr_mma.partition_A(sA); // (MMA,MMA_Q,MMA_HEAD_DIM)
     Tensor tCsB = thr_mma.partition_B(sB); // (MMA,MMA_K,MMA_HEAD_DIM)
     Tensor tCgC = thr_mma.partition_C(gC); // (MMA,MMA_Q,MMA_K)
@@ -403,8 +403,8 @@ void attention_forward2(TOut *out, Tpreatt *preatt, Tatt *att, Tinp *inp,
   auto bHs = Int<64>{};
   auto cta_tiler = make_shape(bQ, bK, bHs); // (BLK_M, BLK_N, BLK_K)
 
-  auto sA = make_layout(make_shape(bQ, bHs));
-  auto sB = make_layout(make_shape(bK, bHs));
+  auto sA = make_layout(make_shape(bQ, bHs), make_stride(Int<1>{}, bHs + Int<1>{}));
+  auto sB = make_layout(make_shape(bK, bHs), make_stride(Int<1>{}, bHs + Int<1>{}));
   auto sC = make_layout(make_shape(bQ, bK));
 
   auto sM = make_layout(make_shape(bK), make_stride(Int<1>{}));
@@ -417,11 +417,11 @@ void attention_forward2(TOut *out, Tpreatt *preatt, Tatt *att, Tinp *inp,
   //                                   Layout<Shape<_1, _1>>{});                 // Val layout  1x1
 
   TiledCopy copyA = make_tiled_copy(Copy_Atom<UniversalCopy<float>, float>{},
-                                    Layout<Shape<_8, _16>>{}, // Thr layout 32x8 k-major
+                                    Layout<Shape<_4, _32>>{}, // Thr layout 32x8 k-major
                                     Layout<Shape<_1, _1>>{});
 
   TiledCopy copyB = make_tiled_copy(Copy_Atom<UniversalCopy<float>, float>{},
-                                    Layout<Shape<_8, _16>>{}, // Thr layout 32x8 k-major
+                                    Layout<Shape<_4, _32>>{}, // Thr layout 32x8 k-major
                                     Layout<Shape<_1, _1>>{});
 
   TiledMMA mmaC = make_tiled_mma(SM80_16x8x8_F32TF32TF32F32_TN{},
