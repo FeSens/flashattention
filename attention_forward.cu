@@ -2,10 +2,9 @@
 Kernels for attention forward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math -I<PATH_TO_CUTLASS>/cutlass/include attention_forward.cu --expt-relaxed-constexpr -o attention_forward -lcublas
+nvcc -O3 --use_fast_math -I/home/ubuntu/cutlass/include attention_forward.cu --expt-relaxed-constexpr -lcublas -o attention_forward
 nvcc -O3 --use_fast_math -I/home/ubuntu/cutlass/include attention_forward.cu --expt-relaxed-constexpr -o attention_forward -lcublas --generate-line-info  && ./attention_forward 6
-nvcc -O3 --use_fast_math -I/home/ubuntu/cutlass/include -arch=sm_80 attention_forward.cu --expt-relaxed-constex
-pr -o attention_forward -lcublas --generate-line-info  && ./attention_forward 1
+nvcc -O3 --use_fast_math -I/home/ubuntu/flash/cutlass/include -arch=sm_80 --generate-line-info  -lcublas -lcublasLt --expt-relaxed-constexpr attention_forward.cu  -o attention_forward && ./attention_forward 1
 
 version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
 ./attention_forward 1
@@ -42,7 +41,7 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 // ----------------------------------------------------------------------------
 // CUDA setup
 
-static cublasHandle_t cublas_handle;
+// static cublasHandle_t cublas_handle;
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -264,15 +263,15 @@ __global__ void attention_value_kernel1(float *out, const float *att, const floa
   }
 }
 
-template <class QKLayout, class PreattLayout, class ProblemShape, class CtaTiler,
-          class TA, class AStride, class ASmemLayout, class TiledCopyA,
-          class TB, class BStride, class BSmemLayout, class TiledCopyB,
-          class TC, class CStride, class CSmemLayout, class TiledMma,
+template <class QKLayout, class PreattLayout, class CtaTiler,
+          class TA, class ASmemLayout, class TiledCopyA,
+          class TB, class BSmemLayout, class TiledCopyB,
+          class TC, class CSmemLayout, class TiledMma,
           class MSmemLayout>
-__global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void attention_query_key_kernel2(QKLayout qk_layout, PreattLayout preatt_layout, ProblemShape shape_MNK, CtaTiler cta_tiler,
-                                                                                                        TA const *A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a,
-                                                                                                        TB const *B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b,
-                                                                                                        TC *C, CStride dC, CSmemLayout sS_layout, TiledMma mma, int KEY_BLOCK, float softmax_scale,
+__global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void attention_query_key_kernel2(QKLayout qk_layout, PreattLayout preatt_layout, CtaTiler cta_tiler,
+                                                                                                        TA const *A, ASmemLayout sA_layout, TiledCopyA copy_a,
+                                                                                                        TB const *B, BSmemLayout sB_layout, TiledCopyB copy_b,
+                                                                                                        TC *C, CSmemLayout sS_layout, TiledMma mma, int KEY_BLOCK, float softmax_scale,
                                                                                                         MSmemLayout sM_layout)
 {
   using namespace cute;
@@ -280,10 +279,6 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void atte
   Tensor mQ = make_tensor(make_gmem_ptr(A), qk_layout);     // (B, NH, T, HS)
   Tensor mK = make_tensor(make_gmem_ptr(B), qk_layout);     // (B, NH, T, HS)
   Tensor mP = make_tensor(make_gmem_ptr(C), preatt_layout); // (B, NH, T, T)
-
-  //   Tensor mA = make_tensor(make_gmem_ptr(A), select<0, 2>(shape_MNK), dA); // (T, HS)
-  //   Tensor mB = make_tensor(make_gmem_ptr(B), select<1, 2>(shape_MNK), dB); // (T, HS)
-  //   Tensor mC = make_tensor(make_gmem_ptr(C), select<0, 1>(shape_MNK), dC); // (T, T)
 
   // Get the appropriate blocks for this thread block
   // auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (blk_Q,blk_K,hs) <- wrong
@@ -299,6 +294,9 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void atte
   ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
   Tensor tAgA = thr_copy_a.partition_S(gA); // (CPY,CPY_Q,CPY_HEAD_DIM,hs_tile)
   Tensor tAsA = thr_copy_a.partition_D(sA); // (CPY,CPY_Q,CPY_HEAD_DIM)
+
+  // printf("%d, %d, %d, %d\n", int(size<0>(tAgA)), int(size<1>(tAgA)), int(size<2>(tAgA)), int(size<3>(tAgA)));
+
   copy(copy_a, tAgA(_, _, _, 0), tAsA);
 
   __shared__ TA smemM[cosize_v<MSmemLayout>];
@@ -306,7 +304,6 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void atte
 
   for (int key_block = 0; key_block < KEY_BLOCK; ++key_block)
   {
-    __syncthreads();
     auto cta_coord = make_coord(query_block, key_block, _); // (blk_Q,blk_K,hs)
 
     // auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
@@ -323,10 +320,13 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void atte
     ThrCopy thr_copy_b = copy_b.get_slice(threadIdx.x);
     Tensor tBgB = thr_copy_b.partition_S(gB); // (CPY,CPY_K,CPY_HEAD_DIM,hs_tile)
     Tensor tBsB = thr_copy_b.partition_D(sB); // (CPY,CPY_K,CPY_HEAD_DIM)
+    Tensor tBrB = make_fragment_like(tBsB);
 
     // Copy gmem to rmem for hs_tile=0, remember we only need to do this once because there is only 1 tile for headim
+    __syncthreads();
     copy(copy_b, tBgB(_, _, _, 0), tBsB);
-
+    cp_async_fence();
+    cp_async_wait<0>();
     ThrMMA thr_mma = mma.get_slice(threadIdx.x);
     Tensor tCsA = thr_mma.partition_A(sA); // (MMA,MMA_Q,MMA_HEAD_DIM)
     Tensor tCsB = thr_mma.partition_B(sB); // (MMA,MMA_K,MMA_HEAD_DIM)
@@ -342,35 +342,18 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void atte
     // int bb = size<1>(tCgC);
     // int cc = size<2>(tCgC);
     // printf("%d, %d, %d\n", aa, bb, cc);
-
     if (query_block < key_block)
     {
-      for (int x = 0; x < size<0>(tCsS); ++x)
-      {
-        for (int y = 0; y < size<1>(tCsS); ++y)
-        {
-          for (int z = 0; z < size<2>(tCsS); ++z)
-          {
-            tCsS(x, y, z) = -INFINITY;
-          }
-        }
-      }
-      copy(tCsS, tCgC);
+      fill(tCrC, -INFINITY);
+      copy(tCrC, tCgC);
     }
     else if (query_block == key_block)
     {
       // We know that the diagonal is all -INFINITY
       gemm(mma, tCsA, tCsB, tCrC);
       axpby(softmax_scale, tCrC, 0, tCgC);
-      // int aa = size<0>(tCgC);
-      // int bb = size<1>(tCgC);
-      // int cc = size<2>(tCgC);
-      // printf("%d, %d, %d \n", aa, bb, cc);
-      // int aa = size<0>(gC);
-      // int bb = size<1>(gC);
-      // // int cc = size<2>(gC);
-      // printf("%d, %d \n", aa, bb);
 
+      // This is inefficient yet, but its ok for now. We will apply the causal mask diferently in the future
       for (int x = 0; x < size<0>(gC); ++x)
       {
         for (int y = 0; y < size<1>(gC); ++y)
@@ -389,20 +372,20 @@ __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value) void atte
     }
 
     // SM (BLK_K) = max(sM(i), sS(i, _))
-    float maxval = -FLT_MAX;
-    for (int i = 0; i < size<0>(sM); ++i)
-    {
-      maxval = fmax(maxval, sS(i, threadIdx.x % size<1>(sS)));
-      sM(i) = maxval;
-    }
+    // float maxval = -FLT_MAX;
+    // for (int i = 0; i < size<0>(sM); ++i)
+    // {
+    //   maxval = fmax(maxval, sS(i, threadIdx.x % size<1>(sS)));
+    //   sM(i) = maxval;
+    // }
     // float maxval = -FLT_MAX;
     // maxval = fmaxf(maxval, );
   }
 }
 
 // TA, TB, TC = the type of variable we are dealing with
-void attention_forward2(float *out, float *preatt, float *att,
-                        const float *inp,
+template <class TOut, class Tpreatt, class Tatt, class Tinp>
+void attention_forward2(TOut *out, Tpreatt *preatt, Tatt *att, Tinp *inp,
                         int B, int T, int C, int NH,
                         const int block_size)
 // void MatMulCaller(float *A, float *B, float *C, int B, int T, int C, int NH, int N, int K)
@@ -412,14 +395,7 @@ void attention_forward2(float *out, float *preatt, float *att,
   const int HS = C / NH;
   // preatt layout
   Layout preatt_layout = make_layout(make_shape(B, NH, T, T), make_stride(T * T * NH, T * T, T, 1));
-  Layout qk_layout = make_layout(make_shape(B, NH, T, HS), make_stride(T * C * 3, HS, C * 3, 1));
-
-  auto prob_shape = make_shape(T, T, HS); // (M, N, K)
-
-  // Define NT strides (mixed)
-  auto dA = make_stride(HS, Int<1>{}); // (dQ, dHs)
-  auto dB = make_stride(HS, Int<1>{}); // (dK, dHs)
-  auto dC = make_stride(Int<1>{}, T);  // (dQ, dK)
+  Layout qk_layout = make_layout(make_shape(B, T, NH, HS), make_stride(T * C * 3, HS, C * 3, 1));
 
   // Define CTA tile sizes (static), those are the block sizes
   auto bQ = Int<32>{};
@@ -427,27 +403,32 @@ void attention_forward2(float *out, float *preatt, float *att,
   auto bHs = Int<64>{};
   auto cta_tiler = make_shape(bQ, bK, bHs); // (BLK_M, BLK_N, BLK_K)
 
-  // Define the smem layouts (static)
-  auto sA = make_layout(make_shape(bQ, bHs),
-                        make_stride(Int<1>{}, bQ + Int<1>{})); // (m,k) -> smem_idx; padded m-major
-  auto sB = make_layout(make_shape(bK, bHs),
-                        make_stride(Int<1>{}, bK + Int<1>{})); // (n,k) -> smem_idx; padded n-major
-  auto sC = make_layout(make_shape(bQ, bK));                   // (m,n) -> smem_idx
+  auto sA = make_layout(make_shape(bQ, bHs));
+  auto sB = make_layout(make_shape(bK, bHs));
+  auto sC = make_layout(make_shape(bQ, bK));
 
   auto sM = make_layout(make_shape(bK), make_stride(Int<1>{}));
 
+  // TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<float>, float>{},
+  //                                   Layout<Shape<_2, _64>>{}, // Thr layout 32x8 k-major
+  //                                   Layout<Shape<_1, _1>>{});                 // Val layout  1x1
+  // TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<float>, float>{},
+  //                                   Layout<Shape<_2, _64>>{}, // Thr layout 32x8 k-major
+  //                                   Layout<Shape<_1, _1>>{});                 // Val layout  1x1
+
   TiledCopy copyA = make_tiled_copy(Copy_Atom<UniversalCopy<float>, float>{},
-                                    Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 32x8 k-major
-                                    Layout<Shape<_1, _1>>{});                 // Val layout  1x1
+                                    Layout<Shape<_8, _16>>{}, // Thr layout 32x8 k-major
+                                    Layout<Shape<_1, _1>>{});
+
   TiledCopy copyB = make_tiled_copy(Copy_Atom<UniversalCopy<float>, float>{},
-                                    Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 32x8 k-major
-                                    Layout<Shape<_1, _1>>{});                 // Val layout  1x1
+                                    Layout<Shape<_8, _16>>{}, // Thr layout 32x8 k-major
+                                    Layout<Shape<_1, _1>>{});
 
   TiledMMA mmaC = make_tiled_mma(SM80_16x8x8_F32TF32TF32F32_TN{},
                                  Layout<Shape<_2, _2, _1>>{}); // 16x16x1 TiledMMA
 
   // TiledMMA mmaC = make_tiled_mma(UniversalFMA<float, float, float>{},
-  //                                Layout<Shape<_16, _16, _1>>{}); // 16x16x1 TiledMMA
+  //                                Layout<Shape<_16, _8, _1>>{}); // 16x16x1 TiledMMA
 
   dim3 dimBlock(size(mmaC));
   dim3 dimGrid(B, NH, size(ceil_div(T, bQ)));
@@ -455,10 +436,10 @@ void attention_forward2(float *out, float *preatt, float *att,
   cudaStream_t stream = 0;
   const int d = C / NH;
   const float softmax_scale = 1.0 / sqrt(d);
-  attention_query_key_kernel2<<<dimGrid, dimBlock, 0, stream>>>(qk_layout, preatt_layout, prob_shape, cta_tiler,
-                                                                inp, dA, sA, copyA,
-                                                                inp + C, dB, sB, copyB,
-                                                                preatt, dC, sC, mmaC, KEY_BLOCK, softmax_scale,
+  attention_query_key_kernel2<<<dimGrid, dimBlock, 0, stream>>>(qk_layout, preatt_layout, cta_tiler,
+                                                                inp, sA, copyA,
+                                                                inp + C, sB, copyB,
+                                                                preatt, sC, mmaC, KEY_BLOCK, softmax_scale,
                                                                 sM);
 }
 
@@ -565,7 +546,7 @@ int main(int argc, char **argv)
   for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
   {
     int block_size = block_sizes[j];
-    int repeat_times = 100;
+    int repeat_times = 2;
 
     float elapsed_time = benchmark_kernel(repeat_times, attention_forward,
                                           kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp,
